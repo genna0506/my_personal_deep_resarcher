@@ -1,11 +1,22 @@
 # 🧠 Agente di ricerca locale
 
 Agente di ricerca da terminale che gira **completamente in locale e a costo zero**:
-cerca sul web con **Brave Search API** (piano gratuito) e analizza i risultati con
+cerca sul web con **Tavily Search API** (piano gratuito) e analizza i risultati con
 **Qwen3 4B** via **Ollama**, citando le fonti.
 
-Pensato per **MacBook Air M1 / 8GB di RAM**: contesto breve, finestra ridotta,
-modalità "thinking" disattivata per non saturare la memoria.
+Pensato per **MacBook Air M1 / 8GB di RAM**: le fonti vengono lette ed elaborate
+**una alla volta** (map-reduce), così si possono leggere articoli interi senza
+saturare la memoria; modalità "thinking" di Qwen3 disattivata.
+
+## Funzionalità
+
+- **Map-reduce**: ogni fonte viene riassunta singolarmente (letta per intero), poi i
+  riassunti vengono fusi in un'analisi citata. Permette di leggere articoli interi e
+  più fonti restando entro gli 8GB.
+- **Salvataggio Markdown**: ogni ricerca finisce in `./ricerche/` per costruire il tuo
+  archivio di approfondimenti.
+- **Domande di follow-up**: con `/f <domanda>` approfondisci sulle stesse fonti, senza
+  consumare una nuova ricerca Tavily.
 
 ---
 
@@ -50,15 +61,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Chiave Brave
+### 3. Chiave Tavily
 ```bash
 cp .env.example .env
-# apri .env e incolla la chiave dopo BRAVE_API_KEY=
+# apri .env e incolla la chiave dopo TAVILY_API_KEY=
 ```
 Oppure, senza file `.env`:
 ```bash
-export BRAVE_API_KEY='la-tua-chiave'
+export TAVILY_API_KEY='tvly-...'
 ```
+> ⚠️ `cp .env.example .env` va fatto **una sola volta**: rieseguirlo cancella la chiave.
 
 ---
 
@@ -75,8 +87,14 @@ python main.py "andamento dei tassi BCE nel 2026"
 python main.py "migliori rapporti per salita in gravel"
 ```
 
+**Approfondire (follow-up)** nella modalità interattiva, dopo una ricerca:
+```
+/f e per il 2025 cosa cambia?
+/f approfondisci il punto 2
+```
+
 L'output è strutturato in: *Risposta sintetica → Approfondimento → Limiti → Fonti*,
-con citazioni `[n]` collegate all'elenco delle fonti.
+con citazioni `[n]` collegate all'elenco delle fonti, e viene salvato in `./ricerche/`.
 
 ---
 
@@ -84,11 +102,15 @@ con citazioni `[n]` collegate all'elenco delle fonti.
 
 | Variabile               | Default                  | Note                                   |
 |-------------------------|--------------------------|----------------------------------------|
-| `TAVILY_API_KEY`        | —                        | **obbligatoria**                       |
-| `OLLAMA_MODEL`          | `qwen3:4b`               | es. `qwen2.5:3b` per più leggerezza    |
-| `OLLAMA_URL`            | `http://localhost:11434` | endpoint Ollama                        |
-| `OLLAMA_NUM_CTX`        | `4096`                   | finestra di contesto (RAM)             |
-| `RESEARCH_NUM_RESULTS`  | `5`                      | numero di fonti web da passare         |
+| `TAVILY_API_KEY`            | —                        | **obbligatoria**                          |
+| `OLLAMA_MODEL`              | `qwen3:4b`               | es. `qwen2.5:3b` per più leggerezza       |
+| `OLLAMA_URL`                | `http://localhost:11434` | endpoint Ollama                           |
+| `OLLAMA_NUM_CTX`            | `8192`                   | finestra di contesto (RAM)                |
+| `RESEARCH_NUM_RESULTS`      | `5`                      | numero di fonti web da passare            |
+| `RESEARCH_MAP_REDUCE`       | `1`                      | `0` = analisi in un'unica richiesta       |
+| `RESEARCH_MAP_CONTENT_CHARS`| `6000`                   | caratteri letti per fonte nel map         |
+| `RESEARCH_SAVE`             | `1`                      | salva le ricerche in Markdown             |
+| `RESEARCH_SAVE_DIR`         | `./ricerche`             | cartella di salvataggio                    |
 
 ---
 
