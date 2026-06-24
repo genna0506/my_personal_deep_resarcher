@@ -69,6 +69,24 @@ CONTENT_CHARS = int(os.getenv("RESEARCH_CONTENT_CHARS", "2500"))
 SAVE_ENABLED = _flag("RESEARCH_SAVE", "1")
 SAVE_DIR = os.getenv("RESEARCH_SAVE_DIR", os.path.join(SCRIPT_DIR, "ricerche"))
 
+# Multi-query: il modello genera piu' ricerche diverse dalla stessa domanda, i
+# risultati vengono uniti, deduplicati e ordinati per rilevanza. Migliora copertura
+# e qualita', e permette di raccogliere piu' fonti del tetto (20) di una sola ricerca.
+# Costo: ogni sotto-query e' UNA ricerca Tavily (3 query = 3 ricerche del budget).
+MULTI_QUERY = _flag("RESEARCH_MULTI_QUERY", "1")
+NUM_QUERIES = int(os.getenv("RESEARCH_NUM_QUERIES", "3"))
+
+# Qualita' delle fonti.
+# - search_depth "advanced" = ranking ed estrazione migliori (costa 2 crediti vs 1).
+# - score minimo = scarta le fonti sotto questa rilevanza (0 = nessun filtro).
+# - domini esclusi = via i forum/social piu' rumorosi (modificabile/svuotabile).
+SEARCH_DEPTH = os.getenv("RESEARCH_SEARCH_DEPTH", "advanced").strip()
+MIN_SCORE = float(os.getenv("RESEARCH_MIN_SCORE", "0"))
+EXCLUDE_DOMAINS = [d.strip() for d in os.getenv(
+    "RESEARCH_EXCLUDE_DOMAINS",
+    "reddit.com,quora.com,x.com,twitter.com,facebook.com,pinterest.com,tripadvisor.com",
+).split(",") if d.strip()]
+
 # Con map-reduce serve sempre il testo integrale delle pagine.
 NEED_RAW = FULL_CONTENT or MAP_REDUCE
 
@@ -181,11 +199,13 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
         "query": query,
         "max_results": count,
         "include_answer": False,
-        "search_depth": "basic",
+        "search_depth": SEARCH_DEPTH,
         "include_raw_content": NEED_RAW,
     }
+    if EXCLUDE_DOMAINS:
+        payload["exclude_domains"] = EXCLUDE_DOMAINS
     try:
-        r = requests.post(TAVILY_URL, json=payload, timeout=20)
+        r = requests.post(TAVILY_URL, json=payload, timeout=30)
     except requests.exceptions.RequestException as e:
         die(f"Errore di rete su Tavily: {e}")
 
@@ -200,14 +220,62 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
     results = r.json().get("results", [])
     out = []
     for item in results[:count]:
-        # 'content' = snippet breve di Tavily; 'raw_content' = testo integrale pagina.
+        # 'content' = snippet breve di Tavily; 'raw_content' = testo integrale pagina;
+        # 'score' = rilevanza 0-1 stimata da Tavily (usata per ordinare/filtrare).
         out.append({
             "title": item.get("title", "").strip(),
             "url": item.get("url", "").strip(),
             "content": (item.get("content") or "").strip(),
             "raw_content": (item.get("raw_content") or "").strip(),
+            "score": float(item.get("score", 0) or 0),
         })
     return out
+
+
+def plan_queries(question: str, n: int = NUM_QUERIES):
+    """Genera n ricerche diverse dalla domanda, in modo DETERMINISTICO (senza LLM).
+
+    qwen3:4b è un modello "reasoning" che, su 8GB e in questa versione di Ollama,
+    non si riesce a spegnere e va in loop quando gli si chiede di generare query.
+    Quindi ampliamo la copertura con angolazioni neutre: la domanda originale,
+    la stessa con l'anno corrente (freschezza) e un paio di modificatori utili.
+    I modificatori sono configurabili via RESEARCH_QUERY_MODIFIERS (CSV)."""
+    year = str(datetime.now().year)
+    default_mods = f"{year},guida,confronto"
+    mods = [m.strip() for m in os.getenv("RESEARCH_QUERY_MODIFIERS", default_mods).split(",")]
+    variants = [question] + [f"{question} {m}" for m in mods if m]
+    out = []
+    for v in variants:
+        if v.lower() not in (x.lower() for x in out):
+            out.append(v)
+        if len(out) >= n:
+            break
+    return out
+
+
+def gather_sources(question: str):
+    """Raccoglie le fonti: multi-query (se attiva) con dedup per URL e ordinamento
+    per rilevanza, oppure singola ricerca. Applica il filtro di score minimo."""
+    if MULTI_QUERY:
+        queries = plan_queries(question)
+        print("   Ricerche generate:")
+        for q in queries:
+            print(f"     • {q}")
+        merged = {}
+        for q in queries:
+            for res in tavily_search(q, NUM_RESULTS):
+                url = res["url"]
+                # tieni, a parita' di URL, la copia con score piu' alto
+                if url and (url not in merged or res["score"] > merged[url]["score"]):
+                    merged[url] = res
+        results = list(merged.values())
+    else:
+        results = tavily_search(question, NUM_RESULTS)
+
+    if MIN_SCORE > 0:
+        results = [r for r in results if r["score"] >= MIN_SCORE]
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:NUM_RESULTS]
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +392,12 @@ def map_summaries(question: str, results):
             {"role": "user", "content": f"Domanda: {question}\n\nFonte:\n{title}\n{body}\n\nRiassunto pertinente:"},
         ]
         label = f"  [{i}/{n}] Riassumo: {title[:55]}"
-        summaries.append(chat(msg, stream=False, num_predict=400, spinner_text=label).strip())
+        summary = chat(msg, stream=False, num_predict=600, spinner_text=label).strip()
+        if not summary:
+            # qwen3 ha esaurito il budget pensando: ripieghiamo sullo snippet grezzo,
+            # così la fonte contribuisce comunque alla sintesi finale.
+            summary = res["content"][:400] or "NON PERTINENTE"
+        summaries.append(summary)
         print(f"   ✓ [{i}/{n}] {title[:55]}")
     return summaries
 
@@ -380,9 +453,10 @@ def save_markdown(question: str, analysis: str, results) -> str:
 def research(question: str, session: dict):
     """Esegue una ricerca completa e aggiorna lo stato di sessione."""
     print(f"\n🔎 Cerco: {question}")
-    results = tavily_search(question)
+    results = gather_sources(question)
     if not results:
-        print("⚠️  Nessun risultato da Tavily per questa query. Prova a riformulare.")
+        print("⚠️  Nessuna fonte trovata (o tutte sotto lo score minimo). Riformula "
+              "o abbassa RESEARCH_MIN_SCORE.")
         return
 
     if MAP_REDUCE:

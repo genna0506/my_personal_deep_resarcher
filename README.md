@@ -13,6 +13,11 @@ saturare la memoria; modalità "thinking" di Qwen3 disattivata.
 - **Map-reduce**: ogni fonte viene riassunta singolarmente (letta per intero), poi i
   riassunti vengono fusi in un'analisi citata. Permette di leggere articoli interi e
   più fonti restando entro gli 8GB.
+- **Multi-query**: da una domanda vengono generate più ricerche con angolazioni
+  diverse (es. + anno, + "guida"), i cui risultati sono uniti e deduplicati. Migliora
+  la copertura e supera il tetto di 20 risultati di una singola ricerca.
+- **Fonti di qualità**: ricerca `advanced`, ordinamento per rilevanza ed esclusione
+  dei domini più rumorosi (reddit, quora, social) per evitare forum poco affidabili.
 - **Salvataggio Markdown**: ogni ricerca finisce in `./ricerche/` per costruire il tuo
   archivio di approfondimenti.
 - **Domande di follow-up**: con `/f <domanda>` approfondisci sulle stesse fonti, senza
@@ -111,6 +116,12 @@ con citazioni `[n]` collegate all'elenco delle fonti, e viene salvato in `./rice
 | `RESEARCH_MAP_CONTENT_CHARS`| `6000`                   | caratteri letti per fonte nel map         |
 | `RESEARCH_SAVE`             | `1`                      | salva le ricerche in Markdown             |
 | `RESEARCH_SAVE_DIR`         | `./ricerche`             | cartella di salvataggio                    |
+| `RESEARCH_MULTI_QUERY`      | `1`                      | genera più ricerche e le unisce           |
+| `RESEARCH_NUM_QUERIES`      | `3`                      | quante ricerche generare                  |
+| `RESEARCH_QUERY_MODIFIERS`  | `<anno>,guida,confronto` | angolazioni aggiunte alla domanda         |
+| `RESEARCH_SEARCH_DEPTH`     | `advanced`               | `basic` per spendere 1 credito invece di 2|
+| `RESEARCH_MIN_SCORE`        | `0`                      | scarta fonti sotto questa rilevanza (0-1) |
+| `RESEARCH_EXCLUDE_DOMAINS`  | reddit, quora, social…   | domini esclusi (vuoto = nessuno)          |
 
 ---
 
