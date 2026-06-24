@@ -21,7 +21,9 @@ import requests
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # Carica il .env che sta ACCANTO a questo script, non nella cartella corrente:
+    # così l'agente funziona anche se lanciato da una directory diversa (es. ~).
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
     pass  # python-dotenv è opzionale: si può usare anche la variabile d'ambiente
 
@@ -38,6 +40,12 @@ NUM_RESULTS = int(os.getenv("RESEARCH_NUM_RESULTS", "5"))
 SNIPPET_CHARS = 320          # taglio di ogni snippet per non gonfiare il contesto
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))  # KV cache contenuta
 TEMPERATURE = 0.3            # poca fantasia: vogliamo aderenza alle fonti
+
+# Lettura del CONTENUTO COMPLETO delle pagine (non solo lo snippet di Tavily).
+# Su 8GB va usato con POCHE fonti (3-4) perche' il testo integrale e' molto lungo:
+# ogni pagina viene comunque troncata a CONTENT_CHARS per non saturare la RAM.
+FULL_CONTENT = os.getenv("RESEARCH_FULL_CONTENT", "0").strip() in {"1", "true", "yes"}
+CONTENT_CHARS = int(os.getenv("RESEARCH_CONTENT_CHARS", "2500"))
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +96,7 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
         "max_results": count,
         "include_answer": False,
         "search_depth": "basic",
+        "include_raw_content": FULL_CONTENT,  # testo completo delle pagine se attivo
     }
     try:
         r = requests.post(TAVILY_URL, json=payload, timeout=15)
@@ -105,19 +114,26 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
     results = r.json().get("results", [])
     out = []
     for item in results[:count]:
+        # Con FULL_CONTENT usa il testo integrale; se Tavily non riesce a estrarlo
+        # (raw_content nullo) ripiega sullo snippet breve, cosi' non si perde la fonte.
+        if FULL_CONTENT:
+            text = (item.get("raw_content") or item.get("content") or "").strip()
+        else:
+            text = (item.get("content") or "").strip()
         out.append({
             "title": item.get("title", "").strip(),
             "url": item.get("url", "").strip(),
-            "description": item.get("content", "").strip(),
+            "description": text,
         })
     return out
 
 
 def build_context(results):
     """Costruisce il blocco di contesto numerato da dare al modello."""
+    limit = CONTENT_CHARS if FULL_CONTENT else SNIPPET_CHARS
     lines = []
     for i, res in enumerate(results, 1):
-        snippet = res["description"][:SNIPPET_CHARS]
+        snippet = res["description"][:limit]
         lines.append(f"[{i}] {res['title']}\n    {snippet}\n    URL: {res['url']}")
     return "\n".join(lines)
 
@@ -239,7 +255,7 @@ def main():
 
     # Modalità interattiva
     print(textwrap.dedent(f"""\
-        🧠 Agente di ricerca locale ({MODEL} + Brave Search)
+        🧠 Agente di ricerca locale ({MODEL} + Tavily Search)
         Scrivi una domanda, oppure 'exit' per uscire.
     """))
     while True:
