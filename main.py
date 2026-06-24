@@ -18,6 +18,9 @@ import os
 import re
 import sys
 import json
+import time
+import itertools
+import threading
 import textwrap
 from datetime import datetime
 
@@ -76,6 +79,41 @@ NEED_RAW = FULL_CONTENT or MAP_REDUCE
 def die(msg: str, code: int = 1):
     print(f"\n❌ {msg}\n", file=sys.stderr)
     sys.exit(code)
+
+
+class Spinner:
+    """Indicatore animato per le attese (chiamate al modello). Si attiva solo se
+    l'output è un terminale: se rediretto su file/pipe non sporca i log."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, text: str = ""):
+        self.text = text
+        self._stop = threading.Event()
+        self._thread = None
+        self._active = sys.stdout.isatty()
+
+    def __enter__(self):
+        if self._active:
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(self.text)  # niente animazione: stampa una riga statica
+        return self
+
+    def _spin(self):
+        for ch in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            print(f"\r{ch} {self.text}", end="", flush=True)
+            time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+            # pulisce la riga dello spinner
+            print("\r" + " " * (len(self.text) + 2) + "\r", end="", flush=True)
 
 
 def strip_think(text: str) -> str:
@@ -175,10 +213,12 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
 # ---------------------------------------------------------------------------
 # Dialogo con il modello (Ollama)
 # ---------------------------------------------------------------------------
-def chat(messages, stream=False, num_predict=None):
+def chat(messages, stream=False, num_predict=None, spinner_text=""):
     """Chiamata a Ollama /api/chat.
     - stream=False: ritorna il testo completo (ripulito dal <think>), senza stampare.
+                    Mostra uno spinner durante l'attesa se spinner_text è dato.
     - stream=True : stampa la risposta mentre arriva e ritorna il testo completo.
+                    Mostra uno spinner finché non arriva il primo token.
     """
     options = {"num_ctx": NUM_CTX, "temperature": TEMPERATURE}
     if num_predict:
@@ -187,14 +227,18 @@ def chat(messages, stream=False, num_predict=None):
 
     try:
         if not stream:
-            r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
-            r.raise_for_status()
+            with Spinner(spinner_text) if spinner_text else _nullctx():
+                r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
+                r.raise_for_status()
             return strip_think(r.json().get("message", {}).get("content", ""))
 
         with requests.post(f"{OLLAMA_URL}/api/chat", json=payload,
                            stream=True, timeout=300) as r:
             r.raise_for_status()
             acc, emitted = "", 0
+            spinner = Spinner(spinner_text) if spinner_text else None
+            if spinner:
+                spinner.__enter__()
             for line in r.iter_lines():
                 if not line:
                     continue
@@ -204,16 +248,27 @@ def chat(messages, stream=False, num_predict=None):
                     acc += piece
                     safe = clean_stream(acc)
                     if len(safe) > emitted:
+                        if spinner:                 # primo testo: spegni lo spinner
+                            spinner.__exit__()
+                            spinner = None
                         print(safe[emitted:], end="", flush=True)
                         emitted = len(safe)
                 if obj.get("done"):
                     break
+            if spinner:                              # nessun testo utile arrivato
+                spinner.__exit__()
             print()
             return strip_think(acc)
     except requests.exceptions.ConnectionError:
         die("Connessione a Ollama persa durante la generazione. È ancora avviato?")
     except requests.exceptions.RequestException as e:
         die(f"Errore durante la generazione: {e}")
+
+
+class _nullctx:
+    """Context manager neutro: usato quando non serve lo spinner."""
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
 
 
 # --- Prompt -----------------------------------------------------------------
@@ -256,18 +311,21 @@ FOLLOWUP_SYSTEM = REDUCE_SYSTEM  # stesse regole: cita le stesse fonti [n]
 def map_summaries(question: str, results):
     """MAP: riassume ogni fonte separatamente. Ritorna una lista di stringhe."""
     summaries = []
+    n = len(results)
     for i, res in enumerate(results, 1):
         title = res["title"] or res["url"]
         body = (res["raw_content"] or res["content"])[:MAP_CONTENT_CHARS]
-        print(f"   [{i}/{len(results)}] Riassumo: {title[:60]}...")
         if not body:
+            print(f"   [{i}/{n}] (fonte vuota, saltata): {title[:55]}")
             summaries.append("NON PERTINENTE")
             continue
         msg = [
             {"role": "system", "content": MAP_SYSTEM},
             {"role": "user", "content": f"Domanda: {question}\n\nFonte:\n{title}\n{body}\n\nRiassunto pertinente:"},
         ]
-        summaries.append(chat(msg, stream=False, num_predict=400).strip())
+        label = f"  [{i}/{n}] Riassumo: {title[:55]}"
+        summaries.append(chat(msg, stream=False, num_predict=400, spinner_text=label).strip())
+        print(f"   ✓ [{i}/{n}] {title[:55]}")
     return summaries
 
 
@@ -293,7 +351,7 @@ def synthesize(question: str, context: str):
             f"Domanda: {question}\n\nRiassunti delle fonti:\n{context}\n\n{ANALYSIS_FORMAT}"},
     ]
     print()
-    return chat(msg, stream=True)
+    return chat(msg, stream=True, spinner_text="Elaboro la sintesi finale...")
 
 
 def slugify(text: str, maxlen: int = 40) -> str:
@@ -368,7 +426,7 @@ def follow_up(question: str, session: dict):
             "Rispondi in italiano usando le stesse fonti, citandole con [n].")},
     ]
     print()
-    chat(msg, stream=True)
+    chat(msg, stream=True, spinner_text="Elaboro l'approfondimento...")
 
 
 # ---------------------------------------------------------------------------
