@@ -232,32 +232,76 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
     return out
 
 
-def plan_queries(question: str, n: int = NUM_QUERIES):
-    """Genera n ricerche diverse dalla domanda, in modo DETERMINISTICO (senza LLM).
+# Marcatori che introducono un VINCOLO dell'utente (da NON cercare, ma da usare come
+# criterio di valutazione critica delle fonti).
+CONSTRAINT_MARKERS = ["escludi", "esclusi", "escludendo", "tranne", "senza ",
+                      "eccetto", "evita", "non includere", "ad eccezione",
+                      "a meno che", "purché", "purche"]
 
-    qwen3:4b è un modello "reasoning" che, su 8GB e in questa versione di Ollama,
-    non si riesce a spegnere e va in loop quando gli si chiede di generare query.
-    Quindi ampliamo la copertura con angolazioni neutre: la domanda originale,
-    la stessa con l'anno corrente (freschezza) e un paio di modificatori utili.
-    I modificatori sono configurabili via RESEARCH_QUERY_MODIFIERS (CSV)."""
+# Parole da NON usare come keyword: stopword italiane, parole interrogative e soprattutto
+# le esche da "listicle/SEO" (migliori, best, top...) che attirano classifiche promozionali.
+STOPWORDS = {
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "a", "da", "in", "con",
+    "su", "per", "tra", "fra", "del", "dello", "della", "dei", "degli", "delle", "al",
+    "allo", "alla", "ai", "agli", "alle", "dal", "dalla", "nel", "nella", "sul", "sulla",
+    "e", "ed", "o", "oppure", "ma", "che", "chi", "cui", "come", "quale", "quali", "quanto",
+    "quanti", "quando", "dove", "perché", "perche", "cosa", "ci", "si", "non", "più", "piu",
+    "meno", "molto", "poco", "tanto", "sono", "è", "e'", "essere", "ha", "hanno", "avere",
+    "ho", "fa", "fare", "attualmente", "adesso", "oggi", "possibile", "possibili", "vorrei",
+    "voglio", "mi", "ti", "se", "dei", "alta", "alto", "alte", "alti", "alla",
+    # esche da classifica/SEO:
+    "migliori", "migliore", "miglior", "best", "top", "classifica", "classifiche",
+    "guida", "guide", "consigli", "consigliati",
+}
+
+
+def split_constraints(question: str):
+    """Separa la domanda 'da cercare' dai VINCOLI dell'utente (es. 'escludi ...').
+    Ritorna (core, constraints): i vincoli vanno alla valutazione, non alla ricerca."""
+    low = question.lower()
+    positions = [low.find(m) for m in CONSTRAINT_MARKERS if m in low]
+    positions = [p for p in positions if p >= 0]
+    if not positions:
+        return question.strip(), ""
+    cut = min(positions)
+    return question[:cut].strip(" ,.;:?!"), question[cut:].strip(" ,.;:?!")
+
+
+def extract_keywords(text: str) -> str:
+    """Riduce una domanda in linguaggio naturale a poche parole chiave per la ricerca,
+    togliendo stopword e le esche da listicle. Mantiene l'ordine, niente duplicati."""
+    words = re.findall(r"[0-9a-zàèéìòóùç]+", text.lower())
+    kept, seen = [], set()
+    for w in words:
+        if len(w) <= 2 or w in STOPWORDS or w in seen:
+            continue
+        seen.add(w)
+        kept.append(w)
+    return " ".join(kept)
+
+
+def search_queries(core_question: str, n: int = NUM_QUERIES):
+    """Costruisce le query di ricerca (DETERMINISTICO, qwen3 va in loop su questo).
+    Parte dalle parole chiave pulite; aggiunge varianti neutre (di default solo l'anno,
+    NON 'guida/confronto' che attirano listicle). Configurabile via RESEARCH_QUERY_MODIFIERS."""
+    base = extract_keywords(core_question) or core_question.strip()
     year = str(datetime.now().year)
-    default_mods = f"{year},guida,confronto"
-    mods = [m.strip() for m in os.getenv("RESEARCH_QUERY_MODIFIERS", default_mods).split(",")]
-    variants = [question] + [f"{question} {m}" for m in mods if m]
-    out = []
-    for v in variants:
-        if v.lower() not in (x.lower() for x in out):
-            out.append(v)
+    mods = [m.strip() for m in os.getenv("RESEARCH_QUERY_MODIFIERS", year).split(",") if m.strip()]
+    out, seen = [], set()
+    for q in [base] + [f"{base} {m}" for m in mods]:
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
         if len(out) >= n:
             break
     return out
 
 
-def gather_sources(question: str):
+def gather_sources(core_question: str):
     """Raccoglie le fonti: multi-query (se attiva) con dedup per URL e ordinamento
     per rilevanza, oppure singola ricerca. Applica il filtro di score minimo."""
     if MULTI_QUERY:
-        queries = plan_queries(question)
+        queries = search_queries(core_question)
         print("   Ricerche generate:")
         for q in queries:
             print(f"     • {q}")
@@ -270,7 +314,7 @@ def gather_sources(question: str):
                     merged[url] = res
         results = list(merged.values())
     else:
-        results = tavily_search(question, NUM_RESULTS)
+        results = tavily_search(extract_keywords(core_question) or core_question, NUM_RESULTS)
 
     if MIN_SCORE > 0:
         results = [r for r in results if r["score"] >= MIN_SCORE]
@@ -342,44 +386,59 @@ class _nullctx:
 # --- Prompt -----------------------------------------------------------------
 MAP_SYSTEM = (
     "/no_think\n"
-    "Sei un assistente di ricerca. Ti viene data UNA fonte e una domanda. "
-    "Estrai SOLO le informazioni della fonte utili a rispondere, in forma di punti "
-    "concisi e fattuali (max 6 punti). Non inventare nulla. "
+    "Sei un analista di ricerca rigoroso. Ti vengono dati UNA fonte e una domanda. "
+    "Estrai SOLO ciò che è davvero presente nella fonte, dando PRIORITÀ AI DATI CONCRETI: "
+    "numeri, percentuali, correlazioni (es. r=0.x), dimensioni dei campioni, nomi, date, "
+    "studi citati. Niente frasi vaghe, niente invenzioni.\n"
+    "Indica anche, in una riga finale 'AFFIDABILITÀ:', che tipo di fonte è "
+    "(studio scientifico / ente o istituzione / articolo divulgativo / blog promozionale "
+    "o classifica 'best/top' senza dati) e quanto ti fidi.\n"
+    "Se ci sono CRITERI dell'utente, segnala se la fonte li rispetta o non lo dice. "
     "Se la fonte non è pertinente, scrivi soltanto: NON PERTINENTE."
 )
 
 REDUCE_SYSTEM = (
     "/no_think\n"
-    "Sei un assistente di ricerca. Rispondi SEMPRE nella lingua della domanda. "
-    "Usa esclusivamente i riassunti numerati forniti: non inventare fatti. "
-    "Cita ogni affermazione con il numero della fonte tra parentesi quadre, es. [1]. "
-    "Se le fonti non bastano, dillo esplicitamente. Sii conciso e fattuale."
+    "Sei un analista di ricerca CRITICO. Rispondi nella lingua della domanda usando SOLO "
+    "i riassunti forniti, citando ogni affermazione con [n]. Applica pensiero critico:\n"
+    "- confronta le fonti tra loro: evidenzia accordi e CONTRADDIZIONI;\n"
+    "- distingui le affermazioni sostenute da DATI da quelle generiche o promozionali;\n"
+    "- DIFFIDA esplicitamente delle classifiche 'migliori/best/top' prive di evidenza;\n"
+    "- privilegia studi ed enti rispetto ai blog;\n"
+    "- se ci sono CRITERI dell'utente, valuta OGNI elemento rispetto ad essi e scarta o "
+    "segnala ciò che non li soddisfa o non fornisce i dati per verificarli.\n"
+    "Non inventare: se i dati mancano, dillo chiaramente."
 )
 
-ANALYSIS_FORMAT = """Produci un'analisi strutturata in italiano con questo formato:
+ANALYSIS_FORMAT = """Produci un'analisi critica in italiano con questo formato:
 
 ## Risposta sintetica
 (2-3 frasi che rispondono direttamente, con citazioni [n])
 
-## Approfondimento
-(punti chiave, ognuno con la sua citazione [n])
+## Evidenze e dati
+(i fatti concreti trovati — numeri, correlazioni, campioni — ognuno con [n])
 
-## Limiti / cose da verificare
-(eventuali lacune nelle fonti)
+## Valutazione critica delle fonti
+(quali fonti sono affidabili e quali no e perché; contraddizioni tra fonti;
+classifiche promozionali da prendere con le pinze)
+{constraints_section}
+## Limiti / cosa manca
+(dati assenti o da verificare altrove)
 
 ## Fonti
 (elenco numerato: [n] Titolo — URL)"""
 
-FOLLOWUP_SYSTEM = REDUCE_SYSTEM  # stesse regole: cita le stesse fonti [n]
+FOLLOWUP_SYSTEM = REDUCE_SYSTEM  # stesse regole critiche: cita le stesse fonti [n]
 
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
-def map_summaries(question: str, results):
+def map_summaries(question: str, results, constraints: str = ""):
     """MAP: riassume ogni fonte separatamente. Ritorna una lista di stringhe."""
     summaries = []
     n = len(results)
+    crit = f"\nCRITERI dell'utente: {constraints}" if constraints else ""
     for i, res in enumerate(results, 1):
         title = res["title"] or res["url"]
         body = (res["raw_content"] or res["content"])[:MAP_CONTENT_CHARS]
@@ -389,7 +448,8 @@ def map_summaries(question: str, results):
             continue
         msg = [
             {"role": "system", "content": MAP_SYSTEM},
-            {"role": "user", "content": f"Domanda: {question}\n\nFonte:\n{title}\n{body}\n\nRiassunto pertinente:"},
+            {"role": "user", "content":
+                f"Domanda: {question}{crit}\n\nFonte:\n{title}\n{body}\n\nEstrazione critica:"},
         ]
         label = f"  [{i}/{n}] Riassumo: {title[:55]}"
         summary = chat(msg, stream=False, num_predict=600, spinner_text=label).strip()
@@ -416,15 +476,23 @@ def build_numbered(results, summaries=None):
     return "\n\n".join(lines)
 
 
-def synthesize(question: str, context: str):
-    """REDUCE: dai riassunti/fonti produce l'analisi finale (in streaming)."""
+def synthesize(question: str, context: str, constraints: str = ""):
+    """REDUCE: dai riassunti/fonti produce l'analisi finale critica (in streaming)."""
+    if constraints:
+        section = ("\n## Conformità ai tuoi criteri\n"
+                   f"(valuta gli elementi rispetto a: «{constraints}» — di' quali li "
+                   "rispettano, quali no e quali non forniscono i dati per saperlo)\n")
+        crit = f"\n\nCRITERI dell'utente (vincoli da rispettare): {constraints}"
+    else:
+        section, crit = "", ""
+    fmt = ANALYSIS_FORMAT.format(constraints_section=section)
     msg = [
         {"role": "system", "content": REDUCE_SYSTEM},
         {"role": "user", "content":
-            f"Domanda: {question}\n\nRiassunti delle fonti:\n{context}\n\n{ANALYSIS_FORMAT}"},
+            f"Domanda: {question}{crit}\n\nRiassunti delle fonti:\n{context}\n\n{fmt}"},
     ]
     print()
-    return chat(msg, stream=True, spinner_text="Elaboro la sintesi finale...")
+    return chat(msg, stream=True, spinner_text="Elaboro la sintesi critica...")
 
 
 def slugify(text: str, maxlen: int = 40) -> str:
@@ -452,8 +520,11 @@ def save_markdown(question: str, analysis: str, results) -> str:
 
 def research(question: str, session: dict):
     """Esegue una ricerca completa e aggiorna lo stato di sessione."""
-    print(f"\n🔎 Cerco: {question}")
-    results = gather_sources(question)
+    core, constraints = split_constraints(question)
+    print(f"\n🔎 Cerco: {core}")
+    if constraints:
+        print(f"   ⚖️  Criterio di valutazione (non cercato): {constraints}")
+    results = gather_sources(core)
     if not results:
         print("⚠️  Nessuna fonte trovata (o tutte sotto lo score minimo). Riformula "
               "o abbassa RESEARCH_MIN_SCORE.")
@@ -461,14 +532,14 @@ def research(question: str, session: dict):
 
     if MAP_REDUCE:
         print(f"   Trovate {len(results)} fonti. Leggo e riassumo una alla volta...")
-        summaries = map_summaries(question, results)
+        summaries = map_summaries(question, results, constraints)
         context = build_numbered(results, summaries)
     else:
         print(f"   Trovate {len(results)} fonti. Genero l'analisi con {MODEL}...")
         context = build_numbered(results)
 
-    print(f"\n🧩 Sintesi finale con {MODEL}:")
-    analysis = synthesize(question, context)
+    print(f"\n🧩 Sintesi critica con {MODEL}:")
+    analysis = synthesize(question, context, constraints)
 
     # Stato per i follow-up
     session["question"] = question

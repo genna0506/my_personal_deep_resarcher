@@ -13,9 +13,15 @@ saturare la memoria; modalità "thinking" di Qwen3 disattivata.
 - **Map-reduce**: ogni fonte viene riassunta singolarmente (letta per intero), poi i
   riassunti vengono fusi in un'analisi citata. Permette di leggere articoli interi e
   più fonti restando entro gli 8GB.
-- **Multi-query**: da una domanda vengono generate più ricerche con angolazioni
-  diverse (es. + anno, + "guida"), i cui risultati sono uniti e deduplicati. Migliora
+- **Query a parole chiave**: la domanda in linguaggio naturale viene ridotta alle
+  parole chiave essenziali; stopword ed esche da classifica (*migliori/best/top/guida*)
+  vengono rimosse per non attirare listicle SEO. I vincoli ("escludi ...") sono separati
+  e usati come criterio di valutazione, non per la ricerca.
+- **Multi-query**: più ricerche con angolazioni diverse, unite e deduplicate. Migliora
   la copertura e supera il tetto di 20 risultati di una singola ricerca.
+- **Sintesi critica**: confronta le fonti, segnala contraddizioni, distingue i dati
+  dalle affermazioni promozionali, diffida delle classifiche senza evidenza e valuta
+  esplicitamente ogni elemento rispetto ai tuoi criteri di esclusione.
 - **Fonti di qualità**: ricerca `advanced`, ordinamento per rilevanza ed esclusione
   dei domini più rumorosi (reddit, quora, social) per evitare forum poco affidabili.
 - **Salvataggio Markdown**: ogni ricerca finisce in `./ricerche/` per costruire il tuo
