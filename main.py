@@ -23,6 +23,7 @@ import itertools
 import threading
 import textwrap
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 
@@ -86,6 +87,18 @@ EXCLUDE_DOMAINS = [d.strip() for d in os.getenv(
     "RESEARCH_EXCLUDE_DOMAINS",
     "reddit.com,quora.com,x.com,twitter.com,facebook.com,pinterest.com,tripadvisor.com",
 ).split(",") if d.strip()]
+
+# Filtro forum/community via PATTERN (non lista fissa): cattura anche i forum
+# italiani non elencati sopra (es. finanzaonline, forumfree...). Per loro natura i
+# forum sono opinioni non verificate, da escludere in una ricerca rigorosa.
+FILTER_FORUMS = _flag("RESEARCH_FILTER_FORUMS", "1")
+
+# Gating critico: scarta le fonti che l'analista marca come non pertinenti, così non
+# diluiscono la sintesi finale (qualità > quantità).
+DROP_IRRELEVANT = _flag("RESEARCH_DROP_IRRELEVANT", "1")
+
+# Diversità: massimo numero di pagine tenute per singolo dominio.
+MAX_PER_DOMAIN = int(os.getenv("RESEARCH_MAX_PER_DOMAIN", "2"))
 
 # Con map-reduce serve sempre il testo integrale delle pagine.
 NEED_RAW = FULL_CONTENT or MAP_REDUCE
@@ -297,9 +310,23 @@ def search_queries(core_question: str, n: int = NUM_QUERIES):
     return out
 
 
+# Host di forum/community noti che non contengono "forum" nel nome.
+FORUM_HOSTS = ("finanzaonline.com", "forumfree.it", "forumcommunity.net",
+               "freeforumzone.com", "mtb-forum.it", "bdc-forum.it",
+               "stackexchange.com", "stackoverflow.com")
+
+
+def is_forumish(url: str) -> bool:
+    """True se l'URL è verosimilmente un forum/community (discussioni non verificate)."""
+    host = urlparse(url).netloc.lower()
+    if any(h in host for h in FORUM_HOSTS):
+        return True
+    return "forum" in host or "community" in host or host.startswith("forum.")
+
+
 def gather_sources(core_question: str):
     """Raccoglie le fonti: multi-query (se attiva) con dedup per URL e ordinamento
-    per rilevanza, oppure singola ricerca. Applica il filtro di score minimo."""
+    per rilevanza. Scarta forum e fonti sotto lo score minimo (qualità > quantità)."""
     if MULTI_QUERY:
         queries = search_queries(core_question)
         print("   Ricerche generate:")
@@ -316,10 +343,26 @@ def gather_sources(core_question: str):
     else:
         results = tavily_search(extract_keywords(core_question) or core_question, NUM_RESULTS)
 
+    if FILTER_FORUMS:
+        before = len(results)
+        results = [r for r in results if not is_forumish(r["url"])]
+        skipped = before - len(results)
+        if skipped:
+            print(f"   🚫 Scartati {skipped} risultati da forum/community.")
     if MIN_SCORE > 0:
         results = [r for r in results if r["score"] >= MIN_SCORE]
     results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:NUM_RESULTS]
+
+    # Diversità: al massimo MAX_PER_DOMAIN pagine per dominio, così non si "spreca"
+    # una fonte leggendo più pagine dello stesso sito.
+    diverse, per_domain = [], {}
+    for r in results:
+        host = urlparse(r["url"]).netloc.lower()
+        if per_domain.get(host, 0) >= MAX_PER_DOMAIN:
+            continue
+        per_domain[host] = per_domain.get(host, 0) + 1
+        diverse.append(r)
+    return diverse[:NUM_RESULTS]
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +477,11 @@ FOLLOWUP_SYSTEM = REDUCE_SYSTEM  # stesse regole critiche: cita le stesse fonti 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+def is_irrelevant(summary: str) -> bool:
+    """True se l'analista ha giudicato la fonte non pertinente (da scartare)."""
+    return summary.strip().upper().startswith("NON PERTINENTE")
+
+
 def map_summaries(question: str, results, constraints: str = ""):
     """MAP: riassume ogni fonte separatamente. Ritorna una lista di stringhe."""
     summaries = []
@@ -533,6 +581,16 @@ def research(question: str, session: dict):
     if MAP_REDUCE:
         print(f"   Trovate {len(results)} fonti. Leggo e riassumo una alla volta...")
         summaries = map_summaries(question, results, constraints)
+        if DROP_IRRELEVANT:
+            kept = [(r, s) for r, s in zip(results, summaries) if not is_irrelevant(s)]
+            dropped = len(results) - len(kept)
+            if dropped:
+                print(f"   🗑️  Scartate {dropped} fonti non pertinenti dalla sintesi.")
+            if not kept:
+                print("⚠️  Nessuna fonte pertinente dopo la lettura. Riformula la domanda.")
+                return
+            results = [r for r, _ in kept]
+            summaries = [s for _, s in kept]
         context = build_numbered(results, summaries)
     else:
         print(f"   Trovate {len(results)} fonti. Genero l'analisi con {MODEL}...")
