@@ -100,6 +100,19 @@ DROP_IRRELEVANT = _flag("RESEARCH_DROP_IRRELEVANT", "1")
 # Diversità: massimo numero di pagine tenute per singolo dominio.
 MAX_PER_DOMAIN = int(os.getenv("RESEARCH_MAX_PER_DOMAIN", "2"))
 
+# Ricerca bilingue: aggiunge una query tradotta in inglese (le fonti autorevoli su
+# tech/finanza/scienza sono spesso in inglese). Traduzione gratuita via deep-translator.
+BILINGUAL = _flag("RESEARCH_BILINGUAL", "1")
+
+# Bonus di rilevanza dato a fonti autorevoli (accademiche/ufficiali): le fa leggere
+# per prime rispetto a blog di pari rilevanza testuale.
+AUTHORITY_BONUS = float(os.getenv("RESEARCH_AUTHORITY_BONUS", "0.15"))
+
+# Loop iterativo di approfondimento: dopo una sintesi, l'agente individua le LACUNE
+# e fa ricerche mirate per colmarle, poi rifonde. MAX_ROUNDS = 1 (iniziale) + N giri.
+MAX_ROUNDS = int(os.getenv("RESEARCH_MAX_ROUNDS", "3"))
+GAP_QUERIES = int(os.getenv("RESEARCH_GAP_QUERIES", "2"))  # lacune inseguite per giro
+
 # Con map-reduce serve sempre il testo integrale delle pagine.
 NEED_RAW = FULL_CONTENT or MAP_REDUCE
 
@@ -265,6 +278,10 @@ STOPWORDS = {
     # esche da classifica/SEO:
     "migliori", "migliore", "miglior", "best", "top", "classifica", "classifiche",
     "guida", "guide", "consigli", "consigliati",
+    # rumore tipico delle frasi sulle "lacune" (usato per costruire le query di gap):
+    "fonti", "fonte", "specificano", "specifica", "indicano", "indica", "manca",
+    "mancano", "mancanti", "forniscono", "fornisce", "riportano", "riporta", "chiaro",
+    "chiari", "esplicitamente", "sufficienti", "quindi", "tuttavia", "inoltre",
 }
 
 
@@ -298,16 +315,49 @@ def search_queries(core_question: str, n: int = NUM_QUERIES):
     Parte dalle parole chiave pulite; aggiunge varianti neutre (di default solo l'anno,
     NON 'guida/confronto' che attirano listicle). Configurabile via RESEARCH_QUERY_MODIFIERS."""
     base = extract_keywords(core_question) or core_question.strip()
+    candidates = [base]
+    if BILINGUAL:                       # variante inglese: bacino di fonti più ricco
+        en = translate_en(base)
+        if en and en.lower() != base.lower():
+            candidates.append(en)
     year = str(datetime.now().year)
     mods = [m.strip() for m in os.getenv("RESEARCH_QUERY_MODIFIERS", year).split(",") if m.strip()]
+    candidates += [f"{base} {m}" for m in mods]
     out, seen = [], set()
-    for q in [base] + [f"{base} {m}" for m in mods]:
-        if q.lower() not in seen:
+    for q in candidates:
+        if q and q.lower() not in seen:
             seen.add(q.lower())
             out.append(q)
         if len(out) >= n:
             break
     return out
+
+
+def translate_en(text: str) -> str:
+    """Traduce in inglese per ampliare il bacino di fonti. Best-effort: se la libreria
+    o la rete non rispondono, ritorna '' e la ricerca resta solo in italiano."""
+    try:
+        from deep_translator import GoogleTranslator
+        return (GoogleTranslator(source="auto", target="en").translate(text) or "").strip()
+    except Exception:
+        return ""
+
+
+# Domini/TLD autorevoli: accademici, enti, istituzioni, editori scientifici.
+AUTHORITY_TLDS = (".edu", ".gov", ".int", ".ac.uk", ".edu.au")
+AUTHORITY_HOSTS = ("wikipedia.org", "who.int", "europa.eu", "ecb.europa.eu", "istat.it",
+                   "bancaditalia.it", "oecd.org", "imf.org", "nih.gov", "ncbi.nlm.nih.gov",
+                   "nature.com", "sciencedirect.com", "springer.com", "jstor.org",
+                   "scholar.google", "pubmed", "apa.org", ".unibo.it", ".unimi.it",
+                   "treccani.it", "consob.it")
+
+
+def authority_bonus(url: str) -> float:
+    """Bonus di score per fonti autorevoli (0 se è un sito qualunque)."""
+    host = urlparse(url).netloc.lower()
+    if host.endswith(AUTHORITY_TLDS) or any(h in host for h in AUTHORITY_HOSTS):
+        return AUTHORITY_BONUS
+    return 0.0
 
 
 # Host di forum/community noti che non contengono "forum" nel nome.
@@ -324,37 +374,38 @@ def is_forumish(url: str) -> bool:
     return "forum" in host or "community" in host or host.startswith("forum.")
 
 
-def gather_sources(core_question: str):
-    """Raccoglie le fonti: multi-query (se attiva) con dedup per URL e ordinamento
-    per rilevanza. Scarta forum e fonti sotto lo score minimo (qualità > quantità)."""
-    if MULTI_QUERY:
-        queries = search_queries(core_question)
-        print("   Ricerche generate:")
-        for q in queries:
-            print(f"     • {q}")
-        merged = {}
-        for q in queries:
-            for res in tavily_search(q, NUM_RESULTS):
-                url = res["url"]
-                # tieni, a parita' di URL, la copia con score piu' alto
-                if url and (url not in merged or res["score"] > merged[url]["score"]):
-                    merged[url] = res
-        results = list(merged.values())
-    else:
-        results = tavily_search(extract_keywords(core_question) or core_question, NUM_RESULTS)
+def search_many(queries, exclude=()):
+    """Esegue le ricerche date, unisce e deduplica per URL (saltando gli URL già
+    visti in 'exclude'), tenendo per ogni URL la copia con score più alto."""
+    merged = {}
+    for q in queries:
+        for res in tavily_search(q, NUM_RESULTS):
+            url = res["url"]
+            if not url or url in exclude:
+                continue
+            if url not in merged or res["score"] > merged[url]["score"]:
+                merged[url] = res
+    return list(merged.values())
 
+
+def rank_results(results):
+    """Filtra forum, applica il bonus di autorevolezza, ordina per score e impone la
+    diversità di dominio. Ritorna le migliori NUM_RESULTS fonti."""
     if FILTER_FORUMS:
         before = len(results)
         results = [r for r in results if not is_forumish(r["url"])]
         skipped = before - len(results)
         if skipped:
             print(f"   🚫 Scartati {skipped} risultati da forum/community.")
+
+    # score effettivo = rilevanza Tavily + bonus autorevolezza (accademiche/ufficiali)
+    for r in results:
+        r["rank"] = r["score"] + authority_bonus(r["url"])
     if MIN_SCORE > 0:
         results = [r for r in results if r["score"] >= MIN_SCORE]
-    results.sort(key=lambda r: r["score"], reverse=True)
+    results.sort(key=lambda r: r["rank"], reverse=True)
 
-    # Diversità: al massimo MAX_PER_DOMAIN pagine per dominio, così non si "spreca"
-    # una fonte leggendo più pagine dello stesso sito.
+    # Diversità: al massimo MAX_PER_DOMAIN pagine per dominio.
     diverse, per_domain = [], {}
     for r in results:
         host = urlparse(r["url"]).netloc.lower()
@@ -365,15 +416,29 @@ def gather_sources(core_question: str):
     return diverse[:NUM_RESULTS]
 
 
+def gather_sources(core_question: str, exclude=()):
+    """Costruisce le query iniziali (multi-query + bilingue), cerca e ordina."""
+    if MULTI_QUERY:
+        queries = search_queries(core_question)
+    else:
+        kw = extract_keywords(core_question) or core_question
+        queries = [kw]
+    print("   Ricerche generate:")
+    for q in queries:
+        print(f"     • {q}")
+    return rank_results(search_many(queries, exclude))
+
+
 # ---------------------------------------------------------------------------
 # Dialogo con il modello (Ollama)
 # ---------------------------------------------------------------------------
-def chat(messages, stream=False, num_predict=None, spinner_text=""):
+def chat(messages, stream=False, num_predict=None, spinner_text="", show=True):
     """Chiamata a Ollama /api/chat.
     - stream=False: ritorna il testo completo (ripulito dal <think>), senza stampare.
-                    Mostra uno spinner durante l'attesa se spinner_text è dato.
-    - stream=True : stampa la risposta mentre arriva e ritorna il testo completo.
-                    Mostra uno spinner finché non arriva il primo token.
+    - stream=True, show=True : stampa la risposta mentre arriva e la ritorna.
+    - stream=True, show=False: consuma lo stream SENZA stampare (spinner attivo per
+      tutta la durata) e ritorna il testo. Serve alle sintesi intermedie del loop:
+      lo streaming evita il timeout di lettura su generazioni molto lunghe (>300s).
     """
     options = {"num_ctx": NUM_CTX, "temperature": TEMPERATURE}
     if num_predict:
@@ -383,7 +448,7 @@ def chat(messages, stream=False, num_predict=None, spinner_text=""):
     try:
         if not stream:
             with Spinner(spinner_text) if spinner_text else _nullctx():
-                r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
+                r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
                 r.raise_for_status()
             return strip_think(r.json().get("message", {}).get("content", ""))
 
@@ -401,18 +466,20 @@ def chat(messages, stream=False, num_predict=None, spinner_text=""):
                 piece = obj.get("message", {}).get("content", "")
                 if piece:
                     acc += piece
-                    safe = clean_stream(acc)
-                    if len(safe) > emitted:
-                        if spinner:                 # primo testo: spegni lo spinner
-                            spinner.__exit__()
-                            spinner = None
-                        print(safe[emitted:], end="", flush=True)
-                        emitted = len(safe)
+                    if show:
+                        safe = clean_stream(acc)
+                        if len(safe) > emitted:
+                            if spinner:              # primo testo: spegni lo spinner
+                                spinner.__exit__()
+                                spinner = None
+                            print(safe[emitted:], end="", flush=True)
+                            emitted = len(safe)
                 if obj.get("done"):
                     break
-            if spinner:                              # nessun testo utile arrivato
+            if spinner:                              # show=False, o nessun testo utile
                 spinner.__exit__()
-            print()
+            if show:
+                print()
             return strip_think(acc)
     except requests.exceptions.ConnectionError:
         die("Connessione a Ollama persa durante la generazione. È ancora avviato?")
@@ -524,8 +591,9 @@ def build_numbered(results, summaries=None):
     return "\n\n".join(lines)
 
 
-def synthesize(question: str, context: str, constraints: str = ""):
-    """REDUCE: dai riassunti/fonti produce l'analisi finale critica (in streaming)."""
+def synthesize(question: str, context: str, constraints: str = "", stream: bool = True):
+    """REDUCE: dai riassunti/fonti produce l'analisi critica. In streaming per la
+    sintesi finale, silenziosa (con spinner) per i round intermedi del loop."""
     if constraints:
         section = ("\n## Conformità ai tuoi criteri\n"
                    f"(valuta gli elementi rispetto a: «{constraints}» — di' quali li "
@@ -539,8 +607,49 @@ def synthesize(question: str, context: str, constraints: str = ""):
         {"role": "user", "content":
             f"Domanda: {question}{crit}\n\nRiassunti delle fonti:\n{context}\n\n{fmt}"},
     ]
-    print()
-    return chat(msg, stream=True, spinner_text="Elaboro la sintesi critica...")
+    if stream:
+        print()
+        return chat(msg, stream=True, show=True, spinner_text="Elaboro la sintesi critica...")
+    # round intermedio: streaming silenzioso (evita il timeout su generazioni lunghe)
+    return chat(msg, stream=True, show=False,
+                spinner_text="Valuto i risultati e cerco le lacune...")
+
+
+def extract_gaps(analysis: str):
+    """Estrae le lacune dalla sezione 'Limiti / cosa manca' della sintesi.
+    Sfrutta il fatto che il modello le elenca in modo affidabile (è ancorato),
+    evitando di chiedergli di GENERARLE da zero (cosa su cui qwen3:4b va in loop)."""
+    gaps, collecting = [], False
+    for line in analysis.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            low = s.lower()
+            collecting = ("limiti" in low or "manca" in low or "verificare" in low)
+            continue
+        if collecting and s:
+            t = s.lstrip("-*•0123456789. ").strip()
+            # scarta righe vuote o che dicono "nessuna lacuna"
+            if len(t) > 8 and "nessun" not in t.lower():
+                gaps.append(t)
+    return gaps
+
+
+def gap_queries(core_question: str, gaps):
+    """Trasforma le lacune in query di ricerca mirate (parole chiave della lacuna +
+    del tema), aggiungendo la variante inglese. Deterministico: niente generazione."""
+    core_kw = extract_keywords(core_question)
+    out, seen = [], set()
+    for g in gaps[:GAP_QUERIES]:
+        gk = extract_keywords(g)
+        if not gk:
+            continue
+        q = f"{core_kw} {gk}".strip()
+        for variant in ([q, translate_en(q)] if BILINGUAL else [q]):
+            v = variant.strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out.append(v)
+    return out
 
 
 def slugify(text: str, maxlen: int = 40) -> str:
@@ -566,48 +675,88 @@ def save_markdown(question: str, analysis: str, results) -> str:
     return path
 
 
+def read_sources(question: str, results, constraints: str):
+    """MAP + gating: legge le fonti, scarta le non pertinenti. Ritorna coppie
+    (fonte, riassunto) da accumulare nella base di conoscenza."""
+    summaries = map_summaries(question, results, constraints)
+    pairs = list(zip(results, summaries))
+    if DROP_IRRELEVANT:
+        kept = [(r, s) for r, s in pairs if not is_irrelevant(s)]
+        dropped = len(pairs) - len(kept)
+        if dropped:
+            print(f"   🗑️  Scartate {dropped} fonti non pertinenti.")
+        return kept
+    return pairs
+
+
 def research(question: str, session: dict):
-    """Esegue una ricerca completa e aggiorna lo stato di sessione."""
+    """Ricerca iterativa: cerca → legge → sintetizza → individua le LACUNE → cerca in
+    modo mirato per colmarle → rifonde. Ripete fino a MAX_ROUNDS o finché restano lacune."""
     core, constraints = split_constraints(question)
     print(f"\n🔎 Cerco: {core}")
     if constraints:
         print(f"   ⚖️  Criterio di valutazione (non cercato): {constraints}")
-    results = gather_sources(core)
-    if not results:
-        print("⚠️  Nessuna fonte trovata (o tutte sotto lo score minimo). Riformula "
-              "o abbassa RESEARCH_MIN_SCORE.")
-        return
 
-    if MAP_REDUCE:
-        print(f"   Trovate {len(results)} fonti. Leggo e riassumo una alla volta...")
-        summaries = map_summaries(question, results, constraints)
-        if DROP_IRRELEVANT:
-            kept = [(r, s) for r, s in zip(results, summaries) if not is_irrelevant(s)]
-            dropped = len(results) - len(kept)
-            if dropped:
-                print(f"   🗑️  Scartate {dropped} fonti non pertinenti dalla sintesi.")
-            if not kept:
-                print("⚠️  Nessuna fonte pertinente dopo la lettura. Riformula la domanda.")
-                return
-            results = [r for r, _ in kept]
-            summaries = [s for _, s in kept]
-        context = build_numbered(results, summaries)
-    else:
-        print(f"   Trovate {len(results)} fonti. Genero l'analisi con {MODEL}...")
-        context = build_numbered(results)
+    knowledge = {}   # url -> (fonte, riassunto): la base di conoscenza che cresce
+    next_queries = []
+    analysis = ""
 
-    print(f"\n🧩 Sintesi critica con {MODEL}:")
-    analysis = synthesize(question, context, constraints)
+    for rnd in range(1, MAX_ROUNDS + 1):
+        final = rnd == MAX_ROUNDS
+        if rnd == 1:
+            results = gather_sources(core)
+        else:
+            print(f"\n🔁 Round {rnd}: cerco per colmare le lacune...")
+            results = rank_results(search_many(next_queries, exclude=set(knowledge)))
 
-    # Stato per i follow-up
+        if results:
+            print(f"   {len(results)} nuove fonti. Leggo e riassumo una alla volta...")
+            for r, s in read_sources(question, results, constraints):
+                knowledge[r["url"]] = (r, s)
+        elif rnd > 1:
+            print("   (nessuna fonte nuova per le lacune)")
+
+        if not knowledge:
+            print("⚠️  Nessuna fonte pertinente. Riformula la domanda.")
+            return
+
+        kept = list(knowledge.values())
+        context = build_numbered([r for r, _ in kept], [s for _, s in kept])
+
+        if final:
+            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
+            analysis = synthesize(question, context, constraints, stream=True)
+            break
+
+        # Round intermedio: sintesi silenziosa solo per individuare le lacune
+        analysis = synthesize(question, context, constraints, stream=False)
+        gaps = extract_gaps(analysis)
+        if not gaps:
+            print("   ✅ Nessuna lacuna rilevante: chiudo con la sintesi finale.")
+            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
+            analysis = synthesize(question, context, constraints, stream=True)
+            break
+
+        print("   🔍 Lacune individuate:")
+        for g in gaps[:GAP_QUERIES]:
+            print(f"     – {g[:90]}")
+        next_queries = gap_queries(core, gaps)
+        if not next_queries:
+            # impossibile costruire query dalle lacune: chiudo con la sintesi finale
+            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
+            analysis = synthesize(question, context, constraints, stream=True)
+            break
+
+    results_final = [r for r, _ in knowledge.values()]
     session["question"] = question
-    session["context"] = context
+    session["context"] = build_numbered(results_final,
+                                        [s for _, s in knowledge.values()])
     session["analysis"] = analysis
-    session["results"] = results
+    session["results"] = results_final
 
     if SAVE_ENABLED and analysis.strip():
         try:
-            path = save_markdown(question, analysis, results)
+            path = save_markdown(question, analysis, results_final)
             print(f"\n💾 Salvato in: {path}")
         except OSError as e:
             print(f"\n⚠️  Impossibile salvare il file Markdown: {e}")

@@ -10,6 +10,13 @@ saturare la memoria; modalità "thinking" di Qwen3 disattivata.
 
 ## Funzionalità
 
+- **Loop iterativo (deep research)**: dopo la prima sintesi l'agente individua le
+  **lacune** ("manca il dato sui campioni"), fa ricerche mirate per colmarle e rifonde.
+  Ripete per più round → da semplice riassuntore a vero ricercatore.
+- **Ricerca bilingue**: aggiunge automaticamente una query tradotta in inglese, dove
+  vivono le fonti più ricche e autorevoli su tech/finanza/scienza (traduzione gratuita).
+- **Ranking per autorevolezza**: le fonti accademiche/ufficiali (`.edu`, `.gov`, enti,
+  editori scientifici) ricevono un bonus e vengono lette per prime.
 - **Map-reduce**: ogni fonte viene riassunta singolarmente (letta per intero), poi i
   riassunti vengono fusi in un'analisi citata. Permette di leggere articoli interi e
   più fonti restando entro gli 8GB.
@@ -22,8 +29,8 @@ saturare la memoria; modalità "thinking" di Qwen3 disattivata.
 - **Sintesi critica**: confronta le fonti, segnala contraddizioni, distingue i dati
   dalle affermazioni promozionali, diffida delle classifiche senza evidenza e valuta
   esplicitamente ogni elemento rispetto ai tuoi criteri di esclusione.
-- **Fonti di qualità**: ricerca `advanced`, ordinamento per rilevanza ed esclusione
-  dei domini più rumorosi (reddit, quora, social) per evitare forum poco affidabili.
+- **Fonti di qualità**: ricerca `advanced`, ordinamento per rilevanza, esclusione dei
+  forum/social, diversità di dominio e scarto delle fonti giudicate non pertinenti.
 - **Salvataggio Markdown**: ogni ricerca finisce in `./ricerche/` per costruire il tuo
   archivio di approfondimenti.
 - **Domande di follow-up**: con `/f <domanda>` approfondisci sulle stesse fonti, senza
