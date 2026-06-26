@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import time
+import hashlib
 import itertools
 import threading
 import textwrap
@@ -112,6 +113,35 @@ AUTHORITY_BONUS = float(os.getenv("RESEARCH_AUTHORITY_BONUS", "0.15"))
 # e fa ricerche mirate per colmarle, poi rifonde. MAX_ROUNDS = 1 (iniziale) + N giri.
 MAX_ROUNDS = int(os.getenv("RESEARCH_MAX_ROUNDS", "3"))
 GAP_QUERIES = int(os.getenv("RESEARCH_GAP_QUERIES", "2"))  # lacune inseguite per giro
+
+# Auto-verifica: passo finale in cui il modello confronta la propria analisi con le
+# fonti già raccolte e segnala le affermazioni non supportate (non riscarica nulla).
+VERIFY = _flag("RESEARCH_VERIFY", "1")
+
+# Consapevolezza temporale: piccolo bonus di ranking alle fonti recenti (quando Tavily
+# fornisce la data). Mite, per non scavalcare la rilevanza.
+RECENCY_BONUS = float(os.getenv("RESEARCH_RECENCY_BONUS", "0.10"))
+
+# Modalità accademica: privilegia paper/studi/fonti dense. Si attiva con tag espliciti
+# (#paper #studi #scientifico ...) o da sola se la domanda contiene segnali accademici.
+ACADEMIC_TAGS = {"#paper", "#papers", "#studi", "#studio", "#scientifico",
+                 "#accademico", "#research", "#science"}
+ACADEMIC_HINTS = ("studio", "studi ", "ricerca scientifica", "correlazione", "evidenza",
+                  "evidenze", "meta-analisi", "metanalisi", "campione", "campioni",
+                  "peer review", "paper", "pubblicazione", "statistic", "r=", "p<",
+                  "trial", "randomizzato", "letteratura scientifica")
+# Repository accademici: in modalità accademica ricevono un bonus di autorevolezza forte
+# e vengono aggiunti come angolazione di ricerca dedicata.
+ACADEMIC_HOSTS = ("arxiv.org", "ncbi.nlm.nih.gov", "pubmed", "scholar.google",
+                  "researchgate.net", "semanticscholar.org", "sciencedirect.com",
+                  "springer.com", "nature.com", "jstor.org", "ssrn.com",
+                  "doaj.org", "plos.org", "frontiersin.org", "mdpi.com")
+ACADEMIC_BONUS = float(os.getenv("RESEARCH_ACADEMIC_BONUS", "0.30"))
+
+# Cache delle ricerche Tavily: evita di ripagare/riscaricare query identiche (entro TTL).
+CACHE_ENABLED = _flag("RESEARCH_CACHE", "1")
+CACHE_TTL_H = float(os.getenv("RESEARCH_CACHE_TTL_H", "24"))  # ore di validità
+CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
 
 # Con map-reduce serve sempre il testo integrale delle pagine.
 NEED_RAW = FULL_CONTENT or MAP_REDUCE
@@ -208,10 +238,45 @@ def check_ollama():
 
 
 # ---------------------------------------------------------------------------
+# Cache delle ricerche
+# ---------------------------------------------------------------------------
+def _cache_path(key: str) -> str:
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"{h}.json")
+
+
+def cache_get(key: str):
+    """Ritorna i risultati in cache se presenti e non scaduti, altrimenti None."""
+    if not CACHE_ENABLED:
+        return None
+    path = _cache_path(key)
+    try:
+        with open(path, encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if time.time() - blob.get("ts", 0) > CACHE_TTL_H * 3600:
+        return None
+    return blob.get("results")
+
+
+def cache_put(key: str, results):
+    if not CACHE_ENABLED:
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_path(key), "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "results": results}, f)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Ricerca web (Tavily)
 # ---------------------------------------------------------------------------
-def tavily_search(query: str, count: int = NUM_RESULTS):
-    """Cerca su Tavily e restituisce una lista di dict {title, url, content}."""
+def tavily_search(query: str, count: int = NUM_RESULTS, include_domains=None):
+    """Cerca su Tavily e restituisce una lista di dict {title, url, content, ...}.
+    Usa la cache su disco per non ripagare query identiche entro il TTL."""
     if not TAVILY_API_KEY:
         die(
             "Manca la TAVILY_API_KEY.\n"
@@ -219,6 +284,11 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
             "   poi esportala:   export TAVILY_API_KEY='tvly-...'\n"
             "   oppure mettila in un file .env (vedi README)."
         )
+
+    cache_key = f"{query}|{count}|{SEARCH_DEPTH}|{NEED_RAW}|{include_domains}|{EXCLUDE_DOMAINS}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     payload = {
         "api_key": TAVILY_API_KEY,
@@ -230,6 +300,8 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
     }
     if EXCLUDE_DOMAINS:
         payload["exclude_domains"] = EXCLUDE_DOMAINS
+    if include_domains:
+        payload["include_domains"] = include_domains
     try:
         r = requests.post(TAVILY_URL, json=payload, timeout=30)
     except requests.exceptions.RequestException as e:
@@ -246,15 +318,17 @@ def tavily_search(query: str, count: int = NUM_RESULTS):
     results = r.json().get("results", [])
     out = []
     for item in results[:count]:
-        # 'content' = snippet breve di Tavily; 'raw_content' = testo integrale pagina;
-        # 'score' = rilevanza 0-1 stimata da Tavily (usata per ordinare/filtrare).
+        # 'content' = snippet breve; 'raw_content' = testo integrale; 'score' = rilevanza;
+        # 'published_date' = data di pubblicazione (quando Tavily riesce a stimarla).
         out.append({
             "title": item.get("title", "").strip(),
             "url": item.get("url", "").strip(),
             "content": (item.get("content") or "").strip(),
             "raw_content": (item.get("raw_content") or "").strip(),
             "score": float(item.get("score", 0) or 0),
+            "date": (item.get("published_date") or "").strip(),
         })
+    cache_put(cache_key, out)
     return out
 
 
@@ -310,16 +384,49 @@ def extract_keywords(text: str) -> str:
     return " ".join(kept)
 
 
-def search_queries(core_question: str, n: int = NUM_QUERIES):
+def detect_academic(question: str):
+    """Rileva se servono fonti dense/accademiche. Si attiva con tag espliciti
+    (#paper #studi ...) oppure da sola se la domanda contiene segnali accademici.
+    Ritorna (domanda_ripulita_dai_tag, is_academic)."""
+    low = question.lower()
+    tags = set(re.findall(r"#\w+", low))
+    is_acad = bool(tags & {t.lower() for t in ACADEMIC_TAGS})
+    clean = re.sub(r"#\w+", "", question).strip()
+    if not is_acad:
+        is_acad = any(h in low for h in ACADEMIC_HINTS)
+    return clean, is_acad
+
+
+def source_year(date_str: str):
+    """Estrae l'anno (int) da una data Tavily tipo '2024-03-01', o None."""
+    m = re.search(r"(19|20)\d{2}", date_str or "")
+    return int(m.group(0)) if m else None
+
+
+def recency_bonus(date_str: str) -> float:
+    """Bonus mite alle fonti recenti (0 se data assente o vecchia)."""
+    y = source_year(date_str)
+    if not y:
+        return 0.0
+    now = datetime.now().year
+    if y >= now:
+        return RECENCY_BONUS
+    if y == now - 1:
+        return RECENCY_BONUS * 0.5
+    return 0.0
+
+
+def search_queries(core_question: str, n: int = NUM_QUERIES, academic: bool = False):
     """Costruisce le query di ricerca (DETERMINISTICO, qwen3 va in loop su questo).
-    Parte dalle parole chiave pulite; aggiunge varianti neutre (di default solo l'anno,
-    NON 'guida/confronto' che attirano listicle). Configurabile via RESEARCH_QUERY_MODIFIERS."""
+    Parte dalle parole chiave pulite; aggiunge la variante inglese e, in modalità
+    accademica, una query mirata a paper/studi. Configurabile via RESEARCH_QUERY_MODIFIERS."""
     base = extract_keywords(core_question) or core_question.strip()
+    en = translate_en(base) if (BILINGUAL or academic) else ""
     candidates = [base]
-    if BILINGUAL:                       # variante inglese: bacino di fonti più ricco
-        en = translate_en(base)
-        if en and en.lower() != base.lower():
-            candidates.append(en)
+    if academic:                        # priorità a una query che punta su paper/studi
+        candidates.append(f"{en or base} peer reviewed study")
+    if BILINGUAL and en and en.lower() != base.lower():
+        candidates.append(en)
     year = str(datetime.now().year)
     mods = [m.strip() for m in os.getenv("RESEARCH_QUERY_MODIFIERS", year).split(",") if m.strip()]
     candidates += [f"{base} {m}" for m in mods]
@@ -352,9 +459,12 @@ AUTHORITY_HOSTS = ("wikipedia.org", "who.int", "europa.eu", "ecb.europa.eu", "is
                    "treccani.it", "consob.it")
 
 
-def authority_bonus(url: str) -> float:
-    """Bonus di score per fonti autorevoli (0 se è un sito qualunque)."""
+def authority_bonus(url: str, academic: bool = False) -> float:
+    """Bonus di score per fonti autorevoli (0 se è un sito qualunque). In modalità
+    accademica i repository di paper/studi ricevono un bonus più forte."""
     host = urlparse(url).netloc.lower()
+    if academic and any(h in host for h in ACADEMIC_HOSTS):
+        return ACADEMIC_BONUS
     if host.endswith(AUTHORITY_TLDS) or any(h in host for h in AUTHORITY_HOSTS):
         return AUTHORITY_BONUS
     return 0.0
@@ -388,8 +498,8 @@ def search_many(queries, exclude=()):
     return list(merged.values())
 
 
-def rank_results(results):
-    """Filtra forum, applica il bonus di autorevolezza, ordina per score e impone la
+def rank_results(results, academic: bool = False):
+    """Filtra forum, applica i bonus (autorevolezza + recency), ordina e impone la
     diversità di dominio. Ritorna le migliori NUM_RESULTS fonti."""
     if FILTER_FORUMS:
         before = len(results)
@@ -398,9 +508,10 @@ def rank_results(results):
         if skipped:
             print(f"   🚫 Scartati {skipped} risultati da forum/community.")
 
-    # score effettivo = rilevanza Tavily + bonus autorevolezza (accademiche/ufficiali)
+    # score effettivo = rilevanza Tavily + autorevolezza + recency
     for r in results:
-        r["rank"] = r["score"] + authority_bonus(r["url"])
+        r["rank"] = (r["score"] + authority_bonus(r["url"], academic)
+                     + recency_bonus(r.get("date", "")))
     if MIN_SCORE > 0:
         results = [r for r in results if r["score"] >= MIN_SCORE]
     results.sort(key=lambda r: r["rank"], reverse=True)
@@ -416,17 +527,17 @@ def rank_results(results):
     return diverse[:NUM_RESULTS]
 
 
-def gather_sources(core_question: str, exclude=()):
-    """Costruisce le query iniziali (multi-query + bilingue), cerca e ordina."""
+def gather_sources(core_question: str, exclude=(), academic: bool = False):
+    """Costruisce le query iniziali (multi-query + bilingue + accademica), cerca e ordina."""
     if MULTI_QUERY:
-        queries = search_queries(core_question)
+        queries = search_queries(core_question, academic=academic)
     else:
         kw = extract_keywords(core_question) or core_question
         queries = [kw]
     print("   Ricerche generate:")
     for q in queries:
         print(f"     • {q}")
-    return rank_results(search_many(queries, exclude))
+    return rank_results(search_many(queries, exclude), academic=academic)
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +651,22 @@ classifiche promozionali da prendere con le pinze)
 
 FOLLOWUP_SYSTEM = REDUCE_SYSTEM  # stesse regole critiche: cita le stesse fonti [n]
 
+VERIFY_SYSTEM = (
+    "/no_think\n"
+    "Sei un fact-checker rigoroso. Ricevi un'ANALISI e i RIASSUNTI delle fonti numerate "
+    "su cui si basa. Per ogni affermazione importante dell'analisi, controlla se è "
+    "davvero sostenuta dalla fonte [n] che cita. NON usare conoscenza esterna: giudica "
+    "solo in base ai riassunti forniti. Sii conciso e onesto."
+)
+
+VERIFY_FORMAT = """Verifica l'analisi rispetto alle fonti e produci in italiano:
+
+## ✅ Verifica delle affermazioni
+- ✓ confermate: affermazioni ben sostenute dalla fonte citata
+- ⚠️ deboli: affermazioni vaghe, oltre i dati, o con citazione [n] non pertinente
+- ✗ errate: affermazioni contraddette dalle fonti o non presenti in esse
+(se è tutto corretto, dillo chiaramente; cita sempre i numeri [n])"""
+
 
 # ---------------------------------------------------------------------------
 # Pipeline
@@ -578,7 +705,7 @@ def map_summaries(question: str, results, constraints: str = ""):
 
 
 def build_numbered(results, summaries=None):
-    """Costruisce il blocco numerato [n] Titolo / testo / URL da dare al reduce."""
+    """Costruisce il blocco numerato [n] Titolo (data) / testo / URL da dare al reduce."""
     lines = []
     for i, res in enumerate(results, 1):
         if summaries is not None:
@@ -587,7 +714,9 @@ def build_numbered(results, summaries=None):
             text = (res["raw_content"] or res["content"])[:CONTENT_CHARS]
         else:
             text = res["content"][:SNIPPET_CHARS]
-        lines.append(f"[{i}] {res['title']}\n{text}\nURL: {res['url']}")
+        y = source_year(res.get("date", ""))
+        head = f"[{i}] {res['title']}" + (f" (data: {y})" if y else " (data: n.d.)")
+        lines.append(f"{head}\n{text}\nURL: {res['url']}")
     return "\n\n".join(lines)
 
 
@@ -615,6 +744,18 @@ def synthesize(question: str, context: str, constraints: str = "", stream: bool 
                 spinner_text="Valuto i risultati e cerco le lacune...")
 
 
+def verify(analysis: str, context: str):
+    """AUTO-VERIFICA: il modello rilegge la propria analisi confrontandola con le fonti
+    già raccolte (NON riscarica nulla) e segnala le affermazioni non supportate."""
+    msg = [
+        {"role": "system", "content": VERIFY_SYSTEM},
+        {"role": "user", "content":
+            f"ANALISI da verificare:\n{analysis}\n\nRIASSUNTI delle fonti:\n{context}\n\n{VERIFY_FORMAT}"},
+    ]
+    print()
+    return chat(msg, stream=True, show=True, spinner_text="Verifico le affermazioni sulle fonti...")
+
+
 def extract_gaps(analysis: str):
     """Estrae le lacune dalla sezione 'Limiti / cosa manca' della sintesi.
     Sfrutta il fatto che il modello le elenca in modo affidabile (è ancorato),
@@ -634,7 +775,7 @@ def extract_gaps(analysis: str):
     return gaps
 
 
-def gap_queries(core_question: str, gaps):
+def gap_queries(core_question: str, gaps, academic: bool = False):
     """Trasforma le lacune in query di ricerca mirate (parole chiave della lacuna +
     del tema), aggiungendo la variante inglese. Deterministico: niente generazione."""
     core_kw = extract_keywords(core_question)
@@ -644,7 +785,12 @@ def gap_queries(core_question: str, gaps):
         if not gk:
             continue
         q = f"{core_kw} {gk}".strip()
-        for variant in ([q, translate_en(q)] if BILINGUAL else [q]):
+        variants = [q]
+        if BILINGUAL or academic:
+            variants.append(translate_en(q))
+        if academic:
+            variants.append(f"{translate_en(q) or q} study")
+        for variant in variants:
             v = variant.strip()
             if v and v.lower() not in seen:
                 seen.add(v.lower())
@@ -662,8 +808,9 @@ def save_markdown(question: str, analysis: str, results) -> str:
     os.makedirs(SAVE_DIR, exist_ok=True)
     ts = datetime.now()
     path = os.path.join(SAVE_DIR, f"{ts:%Y-%m-%d_%H%M%S}_{slugify(question)}.md")
-    sources = "\n".join(f"{i}. [{r['title']}]({r['url']})"
-                        for i, r in enumerate(results, 1))
+    sources = "\n".join(
+        f"{i}. [{r['title']}]({r['url']})" + (f" — {y}" if (y := source_year(r.get('date', ''))) else "")
+        for i, r in enumerate(results, 1))
     doc = (
         f"# {question}\n\n"
         f"*Ricerca del {ts:%d/%m/%Y %H:%M} — modello {MODEL}*\n\n"
@@ -691,9 +838,13 @@ def read_sources(question: str, results, constraints: str):
 
 def research(question: str, session: dict):
     """Ricerca iterativa: cerca → legge → sintetizza → individua le LACUNE → cerca in
-    modo mirato per colmarle → rifonde. Ripete fino a MAX_ROUNDS o finché restano lacune."""
+    modo mirato per colmarle → rifonde. Ripete fino a MAX_ROUNDS o finché restano lacune.
+    Chiude con un'auto-verifica delle affermazioni sulle fonti."""
+    question, academic = detect_academic(question)
     core, constraints = split_constraints(question)
     print(f"\n🔎 Cerco: {core}")
+    if academic:
+        print("   🎓 Modalità accademica: priorità a paper, studi e fonti dense.")
     if constraints:
         print(f"   ⚖️  Criterio di valutazione (non cercato): {constraints}")
 
@@ -701,13 +852,19 @@ def research(question: str, session: dict):
     next_queries = []
     analysis = ""
 
+    def final_synthesis(kept):
+        print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
+        return synthesize(question, build_numbered([r for r, _ in kept],
+                                                   [s for _, s in kept]), constraints, stream=True)
+
     for rnd in range(1, MAX_ROUNDS + 1):
         final = rnd == MAX_ROUNDS
         if rnd == 1:
-            results = gather_sources(core)
+            results = gather_sources(core, academic=academic)
         else:
             print(f"\n🔁 Round {rnd}: cerco per colmare le lacune...")
-            results = rank_results(search_many(next_queries, exclude=set(knowledge)))
+            results = rank_results(search_many(next_queries, exclude=set(knowledge)),
+                                   academic=academic)
 
         if results:
             print(f"   {len(results)} nuove fonti. Leggo e riassumo una alla volta...")
@@ -724,8 +881,7 @@ def research(question: str, session: dict):
         context = build_numbered([r for r, _ in kept], [s for _, s in kept])
 
         if final:
-            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
-            analysis = synthesize(question, context, constraints, stream=True)
+            analysis = final_synthesis(kept)
             break
 
         # Round intermedio: sintesi silenziosa solo per individuare le lacune
@@ -733,24 +889,28 @@ def research(question: str, session: dict):
         gaps = extract_gaps(analysis)
         if not gaps:
             print("   ✅ Nessuna lacuna rilevante: chiudo con la sintesi finale.")
-            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
-            analysis = synthesize(question, context, constraints, stream=True)
+            analysis = final_synthesis(kept)
             break
 
         print("   🔍 Lacune individuate:")
         for g in gaps[:GAP_QUERIES]:
             print(f"     – {g[:90]}")
-        next_queries = gap_queries(core, gaps)
+        next_queries = gap_queries(core, gaps, academic=academic)
         if not next_queries:
-            # impossibile costruire query dalle lacune: chiudo con la sintesi finale
-            print(f"\n🧩 Sintesi critica finale con {MODEL} ({len(kept)} fonti):")
-            analysis = synthesize(question, context, constraints, stream=True)
+            analysis = final_synthesis(kept)
             break
 
     results_final = [r for r, _ in knowledge.values()]
+    context_final = build_numbered(results_final, [s for _, s in knowledge.values()])
+
+    # Auto-verifica: rilegge l'analisi e segnala ciò che le fonti non sostengono
+    if VERIFY and analysis.strip():
+        verification = verify(analysis, context_final)
+        if verification.strip():
+            analysis += "\n\n" + verification
+
     session["question"] = question
-    session["context"] = build_numbered(results_final,
-                                        [s for _, s in knowledge.values()])
+    session["context"] = context_final
     session["analysis"] = analysis
     session["results"] = results_final
 

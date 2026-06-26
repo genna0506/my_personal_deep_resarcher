@@ -15,6 +15,13 @@ saturare la memoria; modalità "thinking" di Qwen3 disattivata.
   Ripete per più round → da semplice riassuntore a vero ricercatore.
 - **Ricerca bilingue**: aggiunge automaticamente una query tradotta in inglese, dove
   vivono le fonti più ricche e autorevoli su tech/finanza/scienza (traduzione gratuita).
+- **Modalità accademica**: con tag (`#paper`, `#studi`, `#scientifico`...) — o da sola
+  quando la domanda contiene segnali accademici — punta su paper, studi e fonti dense
+  (PubMed, arXiv, editori scientifici).
+- **Auto-verifica**: passo finale in cui il modello ricontrolla la propria analisi
+  contro le fonti raccolte e segnala le affermazioni non supportate (✓/⚠️/✗).
+- **Consapevolezza temporale**: usa la data delle fonti, dà un bonus a quelle recenti.
+- **Cache**: non ripaga ricerche Tavily identiche entro il TTL (risparmia quota e tempo).
 - **Ranking per autorevolezza**: le fonti accademiche/ufficiali (`.edu`, `.gov`, enti,
   editori scientifici) ricevono un bonus e vengono lette per prime.
 - **Map-reduce**: ogni fonte viene riassunta singolarmente (letta per intero), poi i
